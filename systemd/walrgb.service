@@ -1,0 +1,10 @@
+[Unit]
+Description=Push pywal colors to RGB hardware
+Wants=walrgb-openrgb.service
+# the tui saves on every keypress, default limit (5 in 10s) locks the service out
+After=walrgb-openrgb.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=exec
+ExecStart=@BINDIR@/walrgb apply --wait 60

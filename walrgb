@@ -1,0 +1,974 @@
+#!/usr/bin/env python3
+"""walrgb - sync openrgb hardware lighting to pywal colors."""
+import colorsys, curses, json, math, os, socket, struct, sys, time
+
+HOST = os.environ.get("WALRGB_HOST", "127.0.0.1")
+PORT = int(os.environ.get("WALRGB_PORT", "6742"))
+CFG_HOME = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+CACHE_HOME = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
+STATE_HOME = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+CFG = os.path.join(CFG_HOME, "walrgb", "config.json")
+WAL = os.path.join(CACHE_HOME, "wal", "colors")
+ROLES = os.path.join(CFG_HOME, "hypr", "state", "color-roles.json")  # accent picker from my dotfiles, optional
+COUNT = os.path.join(CACHE_HOME, "walrgb", "devices")
+OWNED = os.path.join(STATE_HOME, "walrgb", "owned.json")
+
+BLACK, BLUE = (0, 0, 0), "#0000ff"
+PRESETS = ["#0000ff", "#00a2ff", "#00ffd5", "#00ff3c", "#ffd000", "#ff6a00", "#ff0033", "#ff00c8", "#8000ff", "#ffffff"]
+NO_WAL_CYCLE = ["#0000ff", "#00a2ff", "#8000ff", "#ff00c8"]
+MODES = ("static", "palette", "breathing", "flashing", "cycle", "wave", "rainbow")
+FACTORY = ("rainbow wave", "rainbow", "spectrum cycle", "color cycle", "color wave", "spectrum")
+HW_ALIAS = {"breathing": ("breathing",), "flashing": ("flashing", "blink"),
+            "rainbow": ("rainbow wave", "rainbow", "spectrum cycle", "color cycle"), "wave": ("color wave",)}
+DEFAULT = {"enabled": True, "color": "accent", "manual": BLUE, "accent": None, "mode": "static", "speed": None,
+           "brightness": 100, "vivid": True, "cycle": {"colors": [], "every": 10}, "devices": {}, "zones": {}}
+AUTO_ZONE = 60  # argb headers start at 0 leds. extra leds past the real strip are just ignored by the hardware
+FPS = 30
+
+P_COUNT, P_DATA, P_PROTO, P_NAME, P_RESIZE, P_LEDS, P_MODE = 0, 1, 40, 50, 1000, 1050, 1101
+PROTO = 3  # first version with brightness in modes. without it msi/gigabyte silently ignore effect modes
+F_SPEED, F_BRIGHT, F_PER_LED, F_MODE_COLOR = 1, 1 << 4, 1 << 5, 1 << 6
+CM_PER_LED, CM_MODE = 1, 2
+MODE_KEYS = ("value", "flags", "speed_min", "speed_max", "brightness_min", "brightness_max", "colors_min", "colors_max",
+             "speed", "brightness", "direction", "color_mode")
+MODE_FMT = "<iIIIIIIIIIII"
+TYPES = ("motherboard", "ram", "gpu", "cooler", "ledstrip", "keyboard", "mouse", "mousemat", "headset",
+         "headset stand", "gamepad", "light", "speaker", "virtual", "storage", "case", "microphone",
+         "accessory", "keypad")
+PERIPHERALS = {"keyboard", "mouse", "mousemat", "headset", "headset stand", "gamepad", "speaker", "microphone", "keypad"}
+
+
+# ---- openrgb sdk client ----
+
+class Reader:
+    def __init__(self, b): self.b, self.o = b, 0
+
+    def u(self, fmt):
+        v = struct.unpack_from(fmt, self.b, self.o)
+        self.o += struct.calcsize(fmt)
+        return v if len(v) > 1 else v[0]
+
+    def str(self):
+        n = self.u("<H")
+        self.o += n
+        return self.b[self.o - n:self.o].rstrip(b"\0").decode(errors="replace")
+
+    def colors(self):
+        return [self.u("<4B")[:3] for _ in range(self.u("<H"))]
+
+
+def parse_device(b, idx):
+    r = Reader(b)
+    r.u("<I")
+    t = r.u("<i")
+    d = {"idx": idx, "type": TYPES[t] if 0 <= t < len(TYPES) else "unknown", "name": r.str(), "vendor": r.str()}
+    d["desc"], d["version"], d["serial"], d["location"] = r.str(), r.str(), r.str(), r.str()
+    n_modes, d["active"] = r.u("<H"), r.u("<i")
+    d["modes"] = []
+    for _ in range(n_modes):
+        m = {"name": r.str()}
+        m.update(zip(MODE_KEYS, r.u(MODE_FMT)))
+        m["colors"] = r.colors()
+        d["modes"].append(m)
+    d["zones"] = []
+    for _ in range(r.u("<H")):
+        z = {"name": r.str(), "matrix": None}
+        z["type"], z["min"], z["max"], z["leds"] = r.u("<iIII")
+        size = r.u("<H")
+        end = r.o + size
+        if size >= 8:  # keyboards ship a key grid, it's what makes per-key effects line up
+            h, w = r.u("<II")
+            z["matrix"] = (h, w, struct.unpack_from(f"<{h * w}I", r.b, r.o))
+        r.o = end
+        d["zones"].append(z)
+    d["leds"] = []
+    for _ in range(r.u("<H")):
+        d["leds"].append(r.str())
+        r.u("<I")
+    d["colors"] = r.colors()
+    return d
+
+
+def pack_colors(cs):
+    return struct.pack("<H", len(cs)) + b"".join(struct.pack("4B", *c, 0) for c in cs)
+
+
+class OpenRGB:
+    def __init__(self, wait=0):
+        end = time.monotonic() + wait
+        while True:
+            try:
+                self.sock = socket.create_connection((HOST, PORT), 2)
+                break
+            except OSError:
+                if time.monotonic() >= end:
+                    raise ConnectionError(f"can't reach openrgb at {HOST}:{PORT}. is walrgb-openrgb.service running?")
+                time.sleep(1)
+        self.send(P_PROTO, data=struct.pack("<I", PROTO))
+        if struct.unpack("<I", self.recv(P_PROTO))[0] < PROTO:
+            raise ConnectionError("openrgb is too old, walrgb needs 0.6 or newer")
+        self.send(P_NAME, data=b"walrgb\0")
+
+    def send(self, pid, dev=0, data=b""):
+        self.sock.sendall(b"ORGB" + struct.pack("<III", dev, pid, len(data)) + data)
+
+    def _read(self, n):
+        b = b""
+        while len(b) < n:
+            c = self.sock.recv(n - len(b))
+            if not c:
+                raise ConnectionError("openrgb closed the connection")
+            b += c
+        return b
+
+    def recv(self, want):
+        while True:  # server pushes device-list-updated packets at us sometimes, skip them
+            _, _, pid, n = struct.unpack("<4sIII", self._read(16))
+            body = self._read(n)
+            if pid == want:
+                return body
+
+    def count(self):
+        self.send(P_COUNT)
+        return struct.unpack("<I", self.recv(P_COUNT))[0]
+
+    def device(self, i):
+        self.send(P_DATA, i, struct.pack("<I", PROTO))
+        return parse_device(self.recv(P_DATA), i)
+
+    def devices(self):
+        out = []
+        for i in range(self.count()):
+            try:
+                out.append(self.device(i))
+            except (struct.error, IndexError):
+                print(f"walrgb: couldn't read device {i}, skipping it", file=sys.stderr)
+        return out
+
+    def set_mode(self, dev, idx, m):
+        name = m["name"].encode() + b"\0"
+        body = struct.pack("<H", len(name)) + name + struct.pack(MODE_FMT, *(m[k] for k in MODE_KEYS)) + pack_colors(m["colors"])
+        self.send(P_MODE, dev, struct.pack("<Ii", 8 + len(body), idx) + body)
+
+    def resize(self, dev, zone, n):
+        self.send(P_RESIZE, dev, struct.pack("<ii", zone, n))
+
+    def set_leds(self, dev, cs):
+        body = pack_colors(cs)
+        self.send(P_LEDS, dev, struct.pack("<I", 4 + len(body)) + body)
+
+    def close(self):
+        self.count()  # round trip so the server has chewed through everything before we hang up
+        self.sock.close()
+
+
+def devices_quiet():
+    try:
+        rgb = OpenRGB()
+        devs = rgb.devices()
+        rgb.close()
+        return devs, ""
+    except OSError as e:
+        return [], str(e)
+
+
+# ---- config ----
+
+def clamp(v, lo, hi, default):
+    return max(lo, min(hi, v)) if isinstance(v, (int, float)) and not isinstance(v, bool) else default
+
+
+def load_cfg():
+    """read the config and quietly fix anything hand edited into nonsense"""
+    try:
+        with open(CFG) as f:
+            raw = json.load(f)
+    except (OSError, ValueError):
+        raw = {}
+    raw = raw if isinstance(raw, dict) else {}
+    cfg = json.loads(json.dumps(DEFAULT))
+    for k in ("color", "manual", "mode"):
+        if isinstance(raw.get(k), str):
+            cfg[k] = raw[k]
+    for k in ("devices", "zones"):
+        if isinstance(raw.get(k), dict):
+            cfg[k] = {n: v for n, v in raw[k].items() if isinstance(v, (dict, int))}
+    cfg["enabled"] = raw.get("enabled", True) is not False
+    cfg["vivid"] = raw.get("vivid", True) is not False
+    cfg["accent"] = clamp(raw.get("accent"), 0, 15, None)
+    cfg["speed"] = clamp(raw.get("speed"), 0, 100, None)
+    cfg["brightness"] = clamp(raw.get("brightness"), 0, 100, 100)
+    cyc = raw.get("cycle") if isinstance(raw.get("cycle"), dict) else {}
+    cfg["cycle"]["every"] = clamp(cyc.get("every"), 1, 3600, 10)
+    if isinstance(cyc.get("colors"), list):
+        cfg["cycle"]["colors"] = [c for c in cyc["colors"] if isinstance(c, str)]
+    return cfg
+
+
+def write_json(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path + ".tmp", "w") as f:
+        json.dump(data, f, indent=2)
+    os.replace(path + ".tmp", path)  # atomic so the path unit never reads half a file
+
+
+def save_cfg(cfg):
+    write_json(CFG, cfg)
+
+
+def load_owned():
+    try:
+        with open(OWNED) as f:
+            return {k for k in json.load(f) if isinstance(k, str)}
+    except (OSError, ValueError, TypeError):
+        return set()
+
+
+def controlled(name, dtype, cfg):
+    return cfg["devices"].get(name, {}).get("enabled", dtype not in PERIPHERALS)
+
+
+# ---- colors ----
+
+def hex_rgb(h):
+    h = h.strip().lstrip("#")
+    if len(h) == 3:
+        h = "".join(c * 2 for c in h)
+    try:
+        if len(h) == 6:
+            return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+    except ValueError:
+        pass
+    raise ValueError(f"not a color: {h}. use accent, wal0-15 or a hex like #ff8800")
+
+
+def to_hex(c):
+    return "#%02x%02x%02x" % tuple(c)
+
+
+def load_wal():
+    """the 16 pywal colors, or None when pywal isn't set up"""
+    try:
+        with open(WAL) as f:
+            pal = [hex_rgb(l) for l in f if l.strip()][:16]
+    except (OSError, ValueError):
+        return None
+    return (pal * 2)[:16] if len(pal) >= 8 else None
+
+
+def accent_slot(cfg):
+    if cfg["accent"] is not None:
+        return int(cfg["accent"])
+    try:
+        with open(ROLES) as f:
+            return int(json.load(f)["accent"]) % 16
+    except (OSError, ValueError, KeyError, TypeError):
+        return 9  # same default my dotfiles use
+
+
+def is_wal(spec):
+    return spec == "accent" or spec.startswith("wal") and spec[3:].isdigit()
+
+
+def resolve(spec, pal, cfg):
+    """accent / walN / #hex -> rgb. without pywal the wal ones fall back to the manual color"""
+    if not is_wal(spec):
+        return hex_rgb(spec)
+    if pal is None:
+        return hex_rgb(cfg["manual"]) if cfg["manual"] else hex_rgb(BLUE)
+    return pal[accent_slot(cfg) if spec == "accent" else int(spec[3:]) % 16]
+
+
+def safe(spec, pal, cfg):
+    try:
+        return resolve(spec, pal, cfg)
+    except ValueError:
+        return hex_rgb(BLUE)
+
+
+def theme(cfg, pal):
+    """the color list that cycle, wave and palette walk through"""
+    specs = cfg["cycle"]["colors"] or ([f"wal{i}" for i in range(1, 7)] if pal else NO_WAL_CYCLE)
+    if pal is None:
+        specs = [s for s in specs if not is_wal(s)] or NO_WAL_CYCLE
+    out = []
+    for s in specs:
+        try:
+            out.append(resolve(s, pal, cfg))
+        except ValueError:
+            pass
+    return out or [safe("accent", pal, cfg)]
+
+
+def mix(a, b, t):
+    return tuple(round(x + (y - x) * t) for x, y in zip(a, b))
+
+
+def dim(c, k):
+    return tuple(round(v * k) for v in c)
+
+
+def sample(colors, p):
+    """smooth spot p (wraps at 1) along a looping list of colors"""
+    f = (p % 1) * len(colors)
+    i = int(f)
+    return mix(colors[i % len(colors)], colors[(i + 1) % len(colors)], f - i)
+
+
+def vivid(c):
+    """wal colors are tuned for screens and look muddy on leds. full value, a bit more saturation, greys stay grey"""
+    h, s, v = colorsys.rgb_to_hsv(*(x / 255 for x in c))
+    if v == 0:
+        return tuple(c)
+    return tuple(round(x * 255) for x in colorsys.hsv_to_rgb(h, s if s < 0.15 else min(1, s * 1.35), 1))
+
+
+def hue(h):
+    return tuple(round(v * 255) for v in colorsys.hsv_to_rgb(h % 1, 1, 1))
+
+
+# ---- modes ----
+
+def mode_index(dev, *names):
+    low = [m["name"].lower() for m in dev["modes"]]
+    for n in names:
+        if n in low:
+            return low.index(n)
+    return None
+
+
+def direct_ok(dev):
+    # msi mystic light boards drop off usb in direct mode and come back with a dead handle. static is fine
+    return not (dev["vendor"] == "MSI" and dev["type"] == "motherboard") and mode_index(dev, "direct") is not None
+
+
+def plan(dev, mode):
+    """how a mode runs on this device -> (kind, mode index). kind is hw (the device does it), soft (walrgb
+    animates it, smooth), step (walrgb steps it through static, for devices without a usable direct) or static"""
+    still = mode_index(dev, "static", "direct", "custom")  # hardware static before direct, see direct_ok
+    direct = mode_index(dev, "direct") if direct_ok(dev) else None
+    if mode not in MODES:  # a raw hardware mode name from detect
+        i = mode_index(dev, mode.lower())
+        return ("hw", i) if i is not None else ("static", still)
+    if mode in ("static", "palette"):
+        return "hw", still
+    if mode != "wave" or direct is None:  # hardware wave can't follow the palette, soft one can
+        i = mode_index(dev, *HW_ALIAS.get(mode, ()))
+        if i is not None:
+            return "hw", i
+    if direct is not None:
+        return "soft", direct
+    if mode == "cycle" and still is not None:
+        return "step", still
+    return "static", still
+
+
+def positions(dev):
+    """x of every led from 0 to 1, left to right. keyboards use the real key grid"""
+    xs = []
+    for z in dev["zones"]:
+        n = z["leds"]
+        zx = [i / max(1, n - 1) for i in range(n)]
+        if z["matrix"]:
+            h, w, cells = z["matrix"]
+            for c, v in enumerate(cells):
+                if v < n:
+                    zx[v] = (c % w) / max(1, w - 1)
+        xs += zx
+    return (xs + [0.0] * len(dev["leds"]))[:len(dev["leds"])]
+
+
+def rate(speed):
+    return 1.0 if speed is None else 4 ** ((speed - 50) / 50)  # 0 -> 0.25x, 50 -> 1x, 100 -> 4x
+
+
+def effect(mode, dev, base, colors, speed, every, smooth):
+    """a function of time -> one color per led"""
+    n, r, xs = len(dev["leds"]), rate(speed), positions(dev)
+    if mode == "breathing":
+        return lambda t: [dim(base, 0.5 - 0.5 * math.cos(math.pi * t * r / 2))] * n
+    if mode == "flashing":
+        return lambda t: [base if (t * r) % 1 < 0.5 else BLACK] * n
+    if mode == "wave":
+        return lambda t: [sample(colors, x * 0.5 - t * r * 0.1) for x in xs]
+    if mode == "rainbow":
+        return lambda t: [hue(x * 0.5 - t * r * 0.1) for x in xs]
+
+    def cycle(t):
+        k = t / (every / r)
+        i = int(k)
+        fade = 1 if i == 0 or not smooth else min(1, (k - i) * every / r)  # one second crossfade
+        return [mix(colors[(i - 1) % len(colors)], colors[i % len(colors)], fade)] * n
+    return cycle
+
+
+def push(rgb, dev, i, leds, colors, speed, b):
+    """switch dev to mode i with these per-led colors. colors feeds multi color hardware modes"""
+    m = dict(dev["modes"][i])
+    if m["flags"] & F_BRIGHT:  # let the hardware dim if it can, else dim the colors ourselves
+        m["brightness"] = round(m["brightness_min"] + (m["brightness_max"] - m["brightness_min"]) * b)
+        b = 1
+    if m["flags"] & F_MODE_COLOR and m["colors_max"]:
+        k = min(max(m["colors_min"], len(m["colors"]), 1), m["colors_max"])
+        m["colors"] = [dim(c, b) for c in (colors * k)[:k]]
+        m["color_mode"] = CM_MODE
+    elif m["flags"] & F_PER_LED:
+        m["color_mode"] = CM_PER_LED
+    if speed is not None and m["flags"] & F_SPEED:
+        m["speed"] = round(m["speed_min"] + (m["speed_max"] - m["speed_min"]) * speed / 100)
+    leds = [dim(c, b) for c in leds] if m["color_mode"] == CM_PER_LED and leds else None
+    # colors before AND after the mode. msi static only commits colors on a mode update, direct wants them after
+    if leds:
+        rgb.set_leds(dev["idx"], leds)
+    rgb.set_mode(dev["idx"], i, m)
+    if leds:
+        rgb.set_leds(dev["idx"], leds)
+    return b
+
+
+def settings(dev, cfg, pal):
+    """mode, speed, color and theme colors for a device: its own overrides, else the all-devices ones"""
+    d = cfg["devices"].get(dev["name"], {})
+    mode, speed = d.get("mode") or cfg["mode"], clamp(d.get("speed", cfg["speed"]), 0, 100, None)
+    base, colors = safe(d.get("color") or cfg["color"], pal, cfg), theme(cfg, pal)
+    if cfg["vivid"]:
+        base, colors = vivid(base), [vivid(c) for c in colors]
+    return mode, speed, base, colors
+
+
+def preview(dev, cfg, pal, t):
+    """what the leds should look like at time t, for the tui. hardware effects get the soft version"""
+    n = len(dev["leds"])
+    if not cfg["enabled"]:
+        return [BLACK] * n
+    mode, speed, base, colors = settings(dev, cfg, pal)
+    kind = plan(dev, mode)[0]
+    if mode == "palette":
+        leds = [sample(colors, x) for x in positions(dev)]
+    elif kind == "static" or mode == "static" or mode not in MODES:
+        leds = [base] * n
+    else:
+        leds = effect(mode, dev, base, colors, speed, cfg["cycle"]["every"], kind != "step")(t)
+    return [dim(c, cfg["brightness"] / 100) for c in leds]
+
+
+def setup(rgb, dev, cfg, pal):
+    """put one device in its mode. returns an animation job if walrgb has to drive it"""
+    n, b = len(dev["leds"]), cfg["brightness"] / 100
+    if not cfg["enabled"]:
+        _, i = plan(dev, "static")
+        if i is not None:
+            push(rgb, dev, i, [BLACK] * n, [BLACK], None, 1)
+        return None
+    mode, speed, base, colors = settings(dev, cfg, pal)
+    kind, i = plan(dev, mode)
+    if i is None:
+        return print(f"walrgb: {dev['name']} has no mode walrgb can use", file=sys.stderr)
+    if kind in ("soft", "step"):
+        fx = effect(mode, dev, base, colors, speed, cfg["cycle"]["every"], kind == "soft")
+        return {"dev": dev, "i": i, "fx": fx, "step": kind == "step", "speed": speed, "b": b, "last": None,
+                "slow": dev["location"].startswith("I2C")}  # smbus is slow, half the frame rate
+    leds = [sample(colors, x) for x in positions(dev)] if mode == "palette" else [base] * n
+    push(rgb, dev, i, leds, [base] + colors, speed, b)
+
+
+def animate(rgb, jobs, seen):
+    """drive the soft effects until the config or colors change"""
+    tick = 1 / FPS if any(not j["step"] for j in jobs) else 0.25
+    t0, check, frame = time.monotonic(), 0, 0
+    while True:
+        now = time.monotonic()
+        if now >= check:
+            if stamp() != seen:
+                return
+            check = now + 0.5
+        for j in jobs:
+            if j["slow"] and frame % 2:
+                continue
+            leds = j["fx"](now - t0)
+            if leds == j["last"]:
+                continue
+            if j["last"] is None or j["step"]:
+                j["k"] = push(rgb, j["dev"], j["i"], leds, leds[:1], j["speed"], j["b"])
+            else:
+                rgb.set_leds(j["dev"]["idx"], [dim(c, j["k"]) for c in leds])
+            j["last"] = leds
+        frame += 1
+        time.sleep(max(0.0, tick - (time.monotonic() - now)))
+
+
+# ---- reset ----
+
+def key(dev):
+    return f"{dev['name']} @ {dev['location']}"  # location tells the two identical ram sticks apart
+
+
+def reset(rgb, dev):
+    """hand a device back with its factory style effect. openrgb can't read what a device's real default is,
+    but nearly every board, ram kit and gpu ships doing rainbow, so that's what it gets"""
+    i = mode_index(dev, *FACTORY)
+    if i is None:
+        return False
+    m = dict(dev["modes"][i])
+    if m["flags"] & F_BRIGHT:
+        m["brightness"] = m["brightness_max"]
+    rgb.set_mode(dev["idx"], i, m)
+    return True
+
+
+def reset_all():
+    rgb = OpenRGB()
+    owned = load_owned()
+    for dev in rgb.devices():
+        if key(dev) in owned or controlled(dev["name"], dev["type"], load_cfg()):
+            print(f"{dev['name']}: {'reset' if reset(rgb, dev) else 'no factory effect, left as is'}")
+    rgb.close()
+    write_json(OWNED, [])
+
+
+# ---- apply ----
+
+def fit_zones(rgb, dev, cfg):
+    sized = False
+    for zi, z in enumerate(dev["zones"]):
+        want = cfg["zones"].get(z["name"], AUTO_ZONE if z["leds"] == 0 else z["leds"])
+        want = max(z["min"], min(z["max"], want if isinstance(want, int) else z["leds"]))
+        if z["min"] < z["max"] and want != z["leds"]:
+            rgb.resize(dev["idx"], zi, want)
+            sized = True
+    return rgb.device(dev["idx"]) if sized else dev
+
+
+def connect(wait):
+    # on boot the server takes connections before it's done scanning, so it says 0 devices.
+    # wait until we see as many as last time, or the count stops moving
+    rgb = OpenRGB(wait)
+    end = time.monotonic() + wait
+    try:
+        with open(COUNT) as f:
+            known = int(f.read())
+    except (OSError, ValueError):
+        known = 1
+    last, n = -1, rgb.count()
+    while wait and n < known and not (n and n == last) and time.monotonic() < end:
+        time.sleep(1)
+        last, n = n, rgb.count()
+    if n and n != known:
+        os.makedirs(os.path.dirname(COUNT), exist_ok=True)
+        with open(COUNT, "w") as f:
+            f.write(str(n))
+    return rgb
+
+
+def stamp():
+    return tuple(os.stat(p).st_mtime_ns if os.path.exists(p) else 0 for p in (CFG, WAL, ROLES))
+
+
+def apply(wait=0):
+    """push everything once and exit. only sticks around while a soft effect needs driving"""
+    while True:
+        seen, cfg, pal = stamp(), load_cfg(), load_wal()
+        try:
+            rgb = connect(wait)
+            owned = load_owned()
+            before, jobs = set(owned), []
+            for dev in rgb.devices():
+                if not controlled(dev["name"], dev["type"], cfg):
+                    if key(dev) in owned:  # just got toggled off
+                        reset(rgb, dev)
+                        owned.discard(key(dev))
+                    continue
+                owned.add(key(dev))
+                job = setup(rgb, fit_zones(rgb, dev, cfg), cfg, pal)
+                if job:
+                    jobs.append(job)
+            if owned != before:
+                write_json(OWNED, sorted(owned))
+            if jobs:
+                animate(rgb, jobs, seen)
+            rgb.close()
+        except ConnectionError:
+            if wait:
+                raise
+            wait = 60  # server restarted under us, reconnect and rescan
+            continue
+        if stamp() == seen:
+            return
+        # something changed while we were busy. the path unit can't retrigger an active unit, so go again
+
+
+# ---- detect ----
+
+def ansi(c, text="  "):
+    return "\033[48;2;%d;%d;%dm%s\033[0m" % (*c, text)
+
+
+def detect():
+    devs, err = devices_quiet()
+    if err:
+        raise ConnectionError(err)
+    cfg, pal = load_cfg(), load_wal()
+    if pal:
+        print(" pywal   " + "".join(ansi(c) for c in pal))
+        print(" accent  " + ansi(resolve("accent", pal, cfg), "    ") + f" wal{accent_slot(cfg)}")
+    else:
+        print(" pywal   not found, using " + ansi(resolve("accent", pal, cfg), "    ") + f" {cfg['manual']}")
+    if not devs:
+        print("\n openrgb sees no devices. check the i2c group / udev rules (see readme)")
+    tag = {"hw": "%s", "soft": "\033[36m%s\033[0m", "step": "\033[36m%s\033[0m", "static": "\033[2m%s\033[0m"}
+    for d in devs:
+        uniq = list(dict.fromkeys(d["colors"]))[:12]
+        on = "\033[32mcontrolled\033[0m" if controlled(d["name"], d["type"], cfg) else "\033[2mignored\033[0m"
+        print(f"\n \033[1m{d['name']}\033[0m  {on}  \033[2m{d['type']}  {d['location']}\033[0m")
+        print(f"   colors  {''.join(ansi(c) for c in uniq) or '-'}  " + " ".join(to_hex(c) for c in uniq[:4]))
+        print("   zones   " + ", ".join(f"{z['name']} ({z['leds']}{', grid' if z['matrix'] else ''})" for z in d["zones"]))
+        print("   walrgb  " + " ".join(tag[plan(d, m)[0]] % m for m in MODES))
+        print("   device  " + ", ".join(("\033[1m%s\033[0m" if j == d["active"] else "%s") % m["name"]
+                                       for j, m in enumerate(d["modes"])))
+    print("\n \033[2mwalrgb modes: plain = hardware does it, \033[0m\033[36mcyan\033[0m\033[2m = walrgb animates it, "
+          "dim = falls back to static\033[0m")
+
+
+# ---- tui ----
+
+def xterm(c):
+    return 16 + 36 * round(c[0] / 51) + 6 * round(c[1] / 51) + round(c[2] / 51)
+
+
+class Tui:
+    GLOBAL = ("power", "color", "mode", "speed", "brightness", "vivid", "cycle every")
+    TAGS = {"hw": "hardware", "soft": "walrgb", "step": "walrgb", "static": "static only"}
+    PANEL = 84  # previews go right of the list when there's room, under it when there isn't
+
+    def __init__(self, scr):
+        self.scr, self.cfg, self.sel, self.field, self.pairs = scr, load_cfg(), 0, 0, {}
+        self.t0 = time.monotonic()
+        curses.curs_set(0)
+        curses.start_color()
+        curses.use_default_colors()
+        scr.timeout(50)  # redraw ~20x a second so the previews move
+        self.refresh()
+
+    def refresh(self):
+        self.pal = load_wal()
+        self.all, self.msg = devices_quiet()
+        self.devs, self.counts = {}, {}
+        for d in self.all:
+            self.devs.setdefault(d["name"], d)
+            self.counts[d["name"]] = self.counts.get(d["name"], 0) + 1
+        order = lambda n: (n not in self.devs, self.devs[n]["type"] if n in self.devs else "", n)
+        self.names = sorted(set(self.devs) | set(self.cfg["devices"]), key=order)
+        self.all.sort(key=lambda d: order(d["name"]))
+        self.colors = ["accent"] + [f"wal{i}" for i in range(16)] if self.pal else PRESETS
+        if not self.pal and not self.msg:
+            self.msg = "no pywal colors found. pick a color, or press enter for any hex"
+        self.accent = self.pair(fg=vivid(safe("accent", self.pal, self.cfg)))
+        self.dim = self.pair(fg=self.pal[8] if self.pal else (110, 110, 110))
+
+    def pair(self, fg=None, bg=None):
+        key = (fg and xterm(fg), bg and xterm(bg))
+        if key not in self.pairs:
+            n = len(self.pairs) + 1
+            if n >= curses.COLOR_PAIRS or curses.COLORS < 256:
+                return curses.A_NORMAL
+            curses.init_pair(n, key[0] or -1, key[1] or -1)
+            self.pairs[key] = curses.color_pair(n)
+        return self.pairs[key]
+
+    def put(self, y, x, s, attr=0):
+        h, w = self.scr.getmaxyx()
+        if 0 <= y < h - 1 and 0 <= x < w - 1:
+            self.scr.addnstr(y, x, s, w - x - 1, attr)
+
+    def swatch(self, y, x, c, w=4):
+        self.put(y, x, " " * w, self.pair(bg=c))
+
+    def lit(self, y, x, leds, glyph, cells=None):
+        """a row of leds, squeezed or stretched to `cells`"""
+        cells = cells or len(leds)
+        for k in range(cells):
+            c = leds[int(k * len(leds) / cells)] if leds else BLACK
+            self.put(y, x + k * len(glyph), glyph, self.pair(fg=c) if any(c) else self.dim)
+        return cells * len(glyph)
+
+    # ---- device pictures ----
+
+    def art(self, y, x, dev, leds):
+        """draw a device by what it is. returns how many rows it took"""
+        hot = self.row() == dev["name"]
+        self.put(y, x, dev["name"][:34], (self.accent | curses.A_BOLD) if hot else curses.A_BOLD)
+        self.put(y, x + min(35, len(dev["name"]) + 1), dev["type"], self.dim)
+        y += 1
+        if not controlled(dev["name"], dev["type"], self.cfg):
+            self.put(y, x + 2, "not controlled by walrgb", self.dim)
+            return 3
+        rows, off = 0, 0
+        for z in dev["zones"]:
+            zl, off = leds[off:off + z["leds"]], off + z["leds"]
+            if z["matrix"]:  # keyboards, the actual key grid
+                h, w, cells = z["matrix"]
+                glyph = "■ " if w * 3 > 44 else "██ "
+                for r in range(h):
+                    for c in range(w):
+                        v = cells[r * w + c]
+                        if v < len(zl):
+                            self.put(y + rows + r, x + 2 + c * len(glyph), glyph[:-1], self.pair(fg=zl[v]) if any(zl[v]) else self.dim)
+                rows += h
+            elif dev["type"] == "ram":  # a stick: lights along the top, board under it
+                self.put(y + rows, x + 2, "▕", self.dim)
+                n = self.lit(y + rows, x + 3, zl, "▄▄")
+                self.put(y + rows, x + 3 + n, "▏", self.dim)
+                self.put(y + rows + 1, x + 2, "▕" + "▀" * n + "▏", self.dim)
+                rows += 2
+            elif dev["type"] == "gpu":
+                self.put(y + rows, x + 2, "▐", self.dim)
+                n = self.lit(y + rows, x + 3, zl, "▀", 28)
+                self.put(y + rows, x + 3 + n, "▌", self.dim)
+                rows += 1
+            else:  # headers, strips, fans: name and the strip itself
+                self.put(y + rows, x + 2, f"{z['name'][:12]:<13}", self.dim)
+                if z["leds"]:
+                    self.lit(y + rows, x + 15, zl, "●" if z["leds"] <= 8 else "▬", min(z["leds"], 26))
+                else:
+                    self.put(y + rows, x + 15, "0 leds, set with walrgb zone", self.dim)
+                rows += 1
+        return rows + 2
+
+    def previews(self, y, x):
+        t = time.monotonic() - self.t0
+        for dev in self.all:
+            y += self.art(y, x, dev, preview(dev, self.cfg, self.pal, t))
+
+    # ---- settings list ----
+
+    def label(self, y, hot, text, attr=0):
+        self.put(y, 2, "▍" if hot else " ", self.accent)
+        self.put(y, 4, text, attr | (curses.A_BOLD if hot else 0))
+
+    def draw(self):
+        cfg, n = self.cfg, len(self.GLOBAL)
+        h, w = self.scr.getmaxyx()
+        self.scr.erase()
+        self.put(1, 4, "walrgb", self.accent | curses.A_BOLD)
+        self.put(1, 11, "pywal -> rgb" if self.pal else "manual colors", self.dim)
+        for i, c in enumerate(self.pal or [hex_rgb(p) for p in PRESETS]):
+            self.swatch(2, 4 + i * 3, c, 3)
+        self.put(4, 4, "all devices", self.dim | curses.A_BOLD)
+        vals = ["on" if cfg["enabled"] else "off", cfg["color"], cfg["mode"],
+                "default" if cfg["speed"] is None else f"{cfg['speed']}%", f"{cfg['brightness']}%",
+                "on" if cfg["vivid"] else "off", f"{cfg['cycle']['every']}s"]
+        used = {"speed": cfg["mode"] not in ("static", "palette"), "cycle every": cfg["mode"] == "cycle",
+                "color": cfg["mode"] not in ("palette", "cycle", "wave", "rainbow")}
+        for i, (k, v) in enumerate(zip(self.GLOBAL, vals)):
+            y, hot = 5 + i, self.sel == i
+            self.label(y, hot, f"{k:<12}", 0 if hot else self.dim)
+            self.put(y, 17, f"‹ {v} ›" if hot else f"  {v}", self.accent if hot else self.dim if not used.get(k, True) else 0)
+            x = 22 + len(v)
+            if k == "color":
+                self.swatch(y, x, safe(v, self.pal, cfg))
+            elif k == "cycle every" or k == "mode" and cfg["mode"] in ("palette", "wave", "cycle"):
+                for j, c in enumerate(theme(cfg, self.pal)[:12]):
+                    self.swatch(y, x + j * 2, c, 2)
+            elif k == "brightness":
+                self.put(y, x, "━" * (cfg["brightness"] // 10), self.accent)
+        y0 = 6 + n
+        self.put(y0, 4, "per device", self.dim | curses.A_BOLD)
+        self.put(y0, 15, "· = same as all", self.dim)
+        self.put(y0, 38, "color", self.dim)
+        self.put(y0, 56, "mode", self.dim)
+        for j, name in enumerate(self.names):
+            i, y, d = n + j, y0 + 1 + j, cfg["devices"].get(name, {})
+            dev, hot = self.devs.get(name), self.sel == i
+            on = controlled(name, dev["type"] if dev else None, cfg)
+            text = name[:26] + (f" x{self.counts[name]}" if self.counts.get(name, 0) > 1 else "")
+            self.label(y, hot, "●" if on else "○", self.accent if on else self.dim)
+            self.put(y, 6, f"{text:<30}", (curses.A_BOLD if hot else 0) | (0 if on and dev else self.dim))
+            col, mode = d.get("color") or "·", d.get("mode") or "·"
+            for f, (v, x) in enumerate(((col, 38), (mode, 56))):
+                sel = hot and self.field == f
+                self.put(y, x, f"‹{v}›" if sel else f" {v} ", self.accent | curses.A_BOLD if sel else self.dim if v == "·" else 0)
+            self.swatch(y, 51, safe(d.get("color") or cfg["color"], self.pal, cfg), 2)
+            if dev and on:
+                self.put(y, 72, self.TAGS[plan(dev, d.get("mode") or cfg["mode"])[0]], self.dim)
+        y = y0 + 2 + len(self.names)
+        self.put(y, 4, self.msg, self.dim)
+        self.put(y + 1, 4, "j/k move  h/l change  space toggle  tab color/mode  enter hex  r rescan  q quit", self.dim)
+        if w >= self.PANEL + 40:
+            self.previews(1, self.PANEL)
+        else:
+            self.previews(y + 3, 4)
+        self.scr.refresh()
+
+    @staticmethod
+    def step(cur, opts, d):
+        return opts[(opts.index(cur) + d) % len(opts) if cur in opts else 0]
+
+    def row(self):
+        return self.GLOBAL[self.sel] if self.sel < len(self.GLOBAL) else self.names[self.sel - len(self.GLOBAL)]
+
+    def dev_modes(self, name):
+        dev = self.devs.get(name)
+        hw = [m["name"] for m in dev["modes"] if m["name"].lower() not in MODES + ("direct", "off")] if dev else []
+        return list(MODES) + hw
+
+    def change(self, d):
+        cfg, row = self.cfg, self.row()
+        if row in ("power", "vivid"):
+            key = "enabled" if row == "power" else "vivid"
+            cfg[key] = not cfg[key]
+        elif row == "color":
+            cfg["color"] = self.step(cfg["color"], self.colors, d)
+        elif row == "mode":
+            cfg["mode"] = self.step(cfg["mode"], list(MODES), d)
+        elif row == "speed":
+            v = (50 if cfg["speed"] is None else cfg["speed"]) + 10 * d
+            cfg["speed"] = None if not 0 <= v <= 100 else v
+        elif row == "brightness":
+            cfg["brightness"] = max(0, min(100, cfg["brightness"] + 10 * d))
+        elif row == "cycle every":
+            e = cfg["cycle"]["every"]
+            cfg["cycle"]["every"] = max(1, e + d * (1 if e < 10 or e == 10 and d < 0 else 5))
+        else:
+            dev, f = cfg["devices"].setdefault(row, {}), ("color", "mode")[self.field]
+            v = self.step(dev.get(f), [None] + (self.colors if f == "color" else self.dev_modes(row)), d)
+            dev.pop(f, None) if v is None else dev.update({f: v})
+        if row == "color":
+            self.accent = self.pair(fg=vivid(safe("accent", self.pal, cfg)))
+        save_cfg(cfg)
+
+    def toggle(self):
+        row = self.row()
+        if row in ("power", "vivid"):
+            return self.change(1)
+        if row in self.GLOBAL:
+            return
+        dev = self.devs.get(row)
+        self.cfg["devices"].setdefault(row, {})["enabled"] = not controlled(row, dev["type"] if dev else None, self.cfg)
+        save_cfg(self.cfg)
+
+    def prompt_hex(self):
+        row = self.row()
+        if row in self.GLOBAL and row != "color" or row not in self.GLOBAL and self.field != 0:
+            return
+        h, _ = self.scr.getmaxyx()
+        self.scr.timeout(-1)
+        self.put(h - 2, 4, "hex ›", self.accent)
+        curses.echo()
+        curses.curs_set(1)
+        try:
+            s = self.scr.getstr(h - 2, 10, 8).decode().strip()
+            c = to_hex(hex_rgb(s))
+            if row == "color":
+                self.cfg["color"] = c
+                if not self.pal:
+                    self.cfg["manual"] = c
+            else:
+                self.cfg["devices"].setdefault(row, {})["color"] = c
+            save_cfg(self.cfg)
+        except ValueError as e:
+            self.msg = str(e)
+        finally:
+            curses.noecho()
+            curses.curs_set(0)
+            self.scr.timeout(50)
+
+    def run(self):
+        keys = {curses.KEY_UP: -1, ord("k"): -1, curses.KEY_DOWN: 1, ord("j"): 1}
+        sides = {curses.KEY_LEFT: -1, ord("h"): -1, curses.KEY_RIGHT: 1, ord("l"): 1}
+        while True:
+            self.draw()
+            k = self.scr.getch()
+            if k == ord("q"):
+                return
+            if k in keys:
+                self.sel = (self.sel + keys[k]) % (len(self.GLOBAL) + len(self.names))
+            elif k in sides:
+                self.change(sides[k])
+            elif k == 9:
+                self.field ^= 1
+            elif k == ord(" "):
+                self.toggle()
+            elif k in (10, 13, curses.KEY_ENTER):
+                self.prompt_hex()
+            elif k == ord("r"):
+                self.refresh()
+
+
+# ---- cli ----
+
+USAGE = """walrgb - sync rgb hardware to pywal
+
+  walrgb                        tui
+  walrgb detect                 every device, what it supports, and its current color
+  walrgb apply [--wait SECS]    push colors now (the service runs this)
+  walrgb on|off|toggle [DEV]    lights on/off, or whether walrgb controls DEV
+  walrgb color SPEC [DEV]       accent, wal0-15 or #hex. no pywal = #hex only (default blue)
+  walrgb mode NAME [DEV]        static palette breathing flashing cycle wave rainbow,
+                                or any hardware mode from detect (per device)
+  walrgb cycle [SECS] [SPEC..]  alternate through colors (default wal1-6 every 10s)
+  walrgb speed 0-100|default    effect speed
+  walrgb brightness 0-100
+  walrgb zone NAME LEDS         led count for an argb header (fans, pumps, strips)
+  walrgb reset                  give every device its factory effect back
+
+DEV matches part of a device name or a type like ram, gpu, keyboard."""
+
+
+def match(arg):
+    devs, _ = devices_quiet()
+    a = arg.lower()
+    hits = {d["name"]: d["type"] for d in devs if a in d["name"].lower() or a == d["type"]}
+    return hits or {arg: None}
+
+
+def main(argv):
+    cmd, args = (argv[0] if argv else "tui"), argv[1:]
+    cfg = load_cfg()
+    check = lambda spec: resolve(spec, [BLACK] * 16, cfg)
+    try:
+        if cmd == "tui":
+            curses.wrapper(lambda s: Tui(s).run())
+            return 0
+        if cmd == "apply":
+            return apply(float(args[1]) if args[:1] == ["--wait"] and len(args) > 1 else 0) or 0
+        if cmd == "detect":
+            return detect() or 0
+        if cmd == "reset":
+            return reset_all() or 0
+        if cmd in ("on", "off", "toggle") and len(args) < 2:
+            if not args:
+                cfg["enabled"] = {"on": True, "off": False}.get(cmd, not cfg["enabled"])
+            for name, t in (match(args[0]).items() if args else ()):
+                dev = cfg["devices"].setdefault(name, {})
+                dev["enabled"] = {"on": True, "off": False}.get(cmd, not controlled(name, t, cfg))
+                print(f"{name}: {'controlled' if dev['enabled'] else 'ignored, back to its factory effect'}")
+        elif cmd in ("color", "mode") and 1 <= len(args) <= 2:
+            v = args[0] if cmd == "mode" else args[0] if is_wal(args[0]) else to_hex(check(args[0]))
+            if cmd == "color" and not is_wal(v) and load_wal() is None:
+                cfg["manual"] = v
+            for target in ([cfg["devices"].setdefault(n, {}) for n in match(args[1])] if len(args) > 1 else [cfg]):
+                target[cmd] = v
+        elif cmd == "cycle":
+            if args and args[0].isdigit():
+                cfg["cycle"]["every"], args = max(1, int(args[0])), args[1:]
+            for c in args:
+                check(c)
+            if args:
+                cfg["cycle"]["colors"] = args
+            cfg["mode"] = "cycle"
+        elif cmd in ("speed", "brightness") and len(args) == 1:
+            cfg[cmd] = None if args[0] == "default" and cmd == "speed" else max(0, min(100, int(args[0])))
+        elif cmd == "zone" and len(args) == 2:
+            cfg["zones"][args[0]] = int(args[1])
+        else:
+            print(USAGE)
+            return 0 if cmd in ("-h", "--help", "help") else 1
+        save_cfg(cfg)
+    except (OSError, ValueError) as e:
+        print(f"walrgb: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

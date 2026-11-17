@@ -1,0 +1,12 @@
+post_install() {
+  echo ':: enable walrgb for your user:  systemctl --user enable --now walrgb.path'
+  echo ':: ram over smbus needs the i2c group:  sudo usermod -aG i2c $USER  (then log out and in)'
+}
+
+post_upgrade() {
+  echo ':: restart walrgb:  systemctl --user restart walrgb.path'
+}
+
+pre_remove() {
+  echo ':: run `walrgb reset` first to give your devices their factory effects back'
+}

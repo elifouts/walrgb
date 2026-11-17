@@ -1,0 +1,13 @@
+[Unit]
+Description=Watch pywal colors and walrgb config
+StartLimitIntervalSec=0
+Wants=walrgb.service
+
+[Path]
+TriggerLimitIntervalSec=0
+PathChanged=%h/.cache/wal/colors
+PathChanged=%h/.config/walrgb/config.json
+PathChanged=%h/.config/hypr/state/color-roles.json
+
+[Install]
+WantedBy=default.target
