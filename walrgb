@@ -20,7 +20,7 @@ NO_WAL_CYCLE = ["#0000ff", "#00a2ff", "#8000ff", "#ff00c8"]
 MODES = ("static", "rainbow", "cycle")
 FACTORY = ("rainbow wave", "rainbow", "spectrum cycle", "color cycle", "color wave", "spectrum")
 DEFAULT = {"enabled": True, "color": "accent", "manual": BLUE, "accent": None, "mode": "static", "speed": 50,
-           "brightness": 100, "colors": [], "devices": {}, "zones": {}}
+           "brightness": 100, "balance": [1.0, 1.0, 1.0], "colors": [], "devices": {}, "zones": {}}
 AUTO_ZONE = 60  # argb headers start at 0 leds. extra leds past the real strip are just ignored by the hardware
 
 P_COUNT, P_DATA, P_PROTO, P_RESCAN, P_NAME, P_RESIZE, P_LEDS, P_MODE = 0, 1, 40, 140, 50, 1000, 1050, 1101
@@ -209,6 +209,9 @@ def load_cfg():
     cfg["accent"] = clamp(raw.get("accent"), 0, 15, None)
     cfg["speed"] = clamp(raw.get("speed"), 0, 100, 50)
     cfg["brightness"] = clamp(raw.get("brightness"), 0, 100, 100)
+    bal = raw.get("balance")
+    if isinstance(bal, list) and len(bal) == 3:
+        cfg["balance"] = [clamp(x, 0.2, 1.0, 1.0) for x in bal]
     colors = raw.get("colors", (raw.get("cycle") or {}).get("colors") if isinstance(raw.get("cycle"), dict) else None)
     if isinstance(colors, list):
         cfg["colors"] = [c for c in colors if isinstance(c, str)]
@@ -313,6 +316,18 @@ def theme(cfg, pal):
 
 def dim(c, k):
     return tuple(round(v * k) for v in c)
+
+
+def led(c, bal=(1, 1, 1)):
+    """screen color -> what to send to the leds. screens are gamma encoded and leds are linear, so raw hex
+    comes out pale and washed out. full gamma for the hue so it keeps its depth, gentler on the brightness
+    so dark theme colors stay visible. bal evens out leds that run green or blue heavy"""
+    v = max(c)
+    if not v:
+        return BLACK
+    lin = [(x / 255) ** 2.2 for x in c]
+    k = (v / 255) ** 1.6 / max(lin)
+    return tuple(min(255, round(x * k * w * 255)) for x, w in zip(lin, bal))
 
 
 def fade(a, b, t):
@@ -429,10 +444,12 @@ def setup(rgb, dev, cfg, pal):
     how, i, fps = plan(dev, mode)
     if i is None:
         return print(f"walrgb: {dev['name']} has no mode walrgb can use", file=sys.stderr)
+    bal = cfg["balance"]
     if how == "static":
-        push(rgb, dev, i, [base] * n, b)
+        push(rgb, dev, i, [led(base, bal)] * n, b)
         return None
-    return {"dev": dev, "i": i, "how": how, "fx": effect(mode, dev, base, colors, cfg["speed"]), "b": b,
+    fx = effect(mode, dev, base, colors, cfg["speed"])
+    return {"dev": dev, "i": i, "how": how, "fx": lambda t: [led(c, bal) for c in fx(t)], "b": b,
             "every": 1 / fps, "due": 0, "last": None}
 
 
@@ -847,6 +864,7 @@ USAGE = """walrgb - sync rgb hardware to pywal
   walrgb colors [SPEC..]        what cycle flows through (default wal1-6, none = default)
   walrgb speed 0-100            how fast the cycles move. 50 is about 11s a color
   walrgb brightness 0-100
+  walrgb balance R G B          0.2-1 each, tames leds that run green or blue heavy (default 1 1 1)
   walrgb zone NAME LEDS         led count for an argb header (fans, pumps, strips)
   walrgb reset                  give every device its factory effect back
 
@@ -895,6 +913,8 @@ def main(argv):
             cfg["colors"] = args
         elif cmd in ("speed", "brightness") and len(args) == 1:
             cfg[cmd] = max(0, min(100, int(args[0])))
+        elif cmd == "balance" and len(args) == 3:
+            cfg["balance"] = [max(0.2, min(1.0, float(x))) for x in args]
         elif cmd == "zone" and len(args) == 2:
             cfg["zones"][args[0]] = int(args[1])
         else:

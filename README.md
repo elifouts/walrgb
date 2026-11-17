@@ -50,7 +50,7 @@ walrgb off keyboard         # hand it back, it gets its factory effect
 ```
 
 > [!NOTE]
-> Static is pushed once and nothing keeps running. Rainbow and cycle are animated by walrgb so they fade smoothly and stay in sync on every device, keyboards per key. If something replugs, walrgb picks it back up.
+> Colors are gamma corrected for LEDs so they look like your screen, not washed out. Static is pushed once and nothing keeps running. Rainbow and cycle are animated by walrgb so they fade smoothly and stay in sync on every device, keyboards per key. If something replugs, walrgb picks it back up.
 
 <details>
   <summary><b>Missing a device?</b></summary>
