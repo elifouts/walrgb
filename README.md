@@ -1,10 +1,12 @@
 <p align="center">
   <a href="https://git.io/typing-svg">
-    <img src="https://readme-typing-svg.demolab.com?font=Fira+Code&duration=3000&pause=1000&color=14CB0B&center=true&multiline=true&width=435&lines=walrgb%24" alt="walrgb" />
+    <img src="https://readme-typing-svg.demolab.com?font=Fira+Code&duration=3000&pause=1000&color=ffffff&center=true&multiline=true&width=435&lines=walrgb%24" alt="walrgb" />
   </a>
 </p>
 
 Sync your RGB devices with **Pywal** colors using [OpenRGB](https://openrgb.org). Supports motherboards, RAM, GPUs, fans, keyboards, and more. No Pywal? Use any color.
+
+<img width="1028" height="485" alt="image" src="https://github.com/user-attachments/assets/e7ffbd6d-33c1-4539-81f2-e9a4952e27d0" />
 
 ### Install
 
