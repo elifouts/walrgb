@@ -27,18 +27,18 @@ yay -S walrgb
 Run `walrgb apply` after `wal` or add it to your theme script to sync RGB hardware with Pywal.
 
 ```sh
-walrgb                         # Open TUI
-walrgb detect                  # List devices and supported modes
-walrgb instant [on|off]        # Enable fast background control (default: on)
-walrgb apply [--fg]            # Apply current colors (--fg for foreground)
-walrgb on|off|toggle [DEV]     # Control lighting or walrgb ownership
+walrgb                           # Open TUI
+walrgb detect                    # List devices and supported modes
+walrgb instant [on|off]          # Enable fast background control (default: on)
+walrgb apply [--fg]              # Apply current colors (--fg for foreground)
+walrgb on|off|toggle [DEV]       # Control lighting or walrgb ownership
 walrgb mode static|rainbow [DEV] # Set lighting mode
-walrgb color SPEC [DEV]        # Set accent, wal0–15, or custom hex color
-walrgb speed 0-100             # Set rainbow speed
-walrgb brightness 0-100        # Set brightness
-walrgb balance R G B           # Adjust RGB channel balance (0.2–1)
-walrgb zone NAME LEDS          # Configure ARGB zone LED count
-walrgb reset                   # Restore factory effects
+walrgb color SPEC [DEV]          # Set accent, wal0–15, or custom hex color
+walrgb speed 0-100               # Set rainbow speed
+walrgb brightness 0-100          # Set brightness
+walrgb balance R G B             # Adjust RGB channel balance (0.2–1)
+walrgb zone NAME LEDS            # Configure ARGB zone LED count
+walrgb reset                     # Restore factory effects
 ```
 
 **Color examples**
