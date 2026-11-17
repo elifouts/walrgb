@@ -24,22 +24,49 @@ yay -S walrgb
 
 ### Usage
 
-Run `walrgb apply` after `wal` (or add it to your theme script) to push the new colors.
+Run `walrgb apply` after `wal` or add it to your theme script to sync RGB hardware with Pywal.
 
 ```sh
-walrgb                  # Open TUI with device previews
-walrgb apply             # Apply current colors
-walrgb color accent      # Use Pywal accent color
-walrgb color wal0        # Use a Pywal palette color
-walrgb color '#ff8800'   # Use a custom color
-walrgb mode rainbow      # Enable rainbow mode
-walrgb off keyboard      # Restore factory lighting
-walrgb detect            # List devices and supported modes
+walrgb                         # Open TUI
+walrgb detect                  # List devices and supported modes
+walrgb instant [on|off]        # Enable fast background control (default: on)
+walrgb apply [--fg]            # Apply current colors (--fg for foreground)
+walrgb on|off|toggle [DEV]     # Control lighting or walrgb ownership
+walrgb mode static|rainbow [DEV] # Set lighting mode
+walrgb color SPEC [DEV]        # Set accent, wal0–15, or custom hex color
+walrgb speed 0-100             # Set rainbow speed
+walrgb brightness 0-100        # Set brightness
+walrgb balance R G B           # Adjust RGB channel balance (0.2–1)
+walrgb zone NAME LEDS          # Configure ARGB zone LED count
+walrgb reset                   # Restore factory effects
 ```
+
+**Color examples**
+
+```sh
+walrgb color accent            # Pywal accent color
+walrgb color wal0              # Pywal palette color
+walrgb color '#ff8800'         # Custom color
+```
+
+**Device examples**
+
+```sh
+walrgb off keyboard            # Turn off keyboard lighting
+walrgb mode rainbow ram        # Enable built-in RAM rainbow effect
+```
+
+`DEV` matches part of a device name or a device type (`ram`, `gpu`, `keyboard`).
+
+**Notes**
+- `rainbow` uses the device's built-in effect.
+- Without Pywal, only custom hex colors are available (default: blue).
+- RGB balance defaults to `1 1 1` and can compensate for LEDs with uneven channel output.
+
 
 ### Instant mode
 
-Keeps the OpenRGB server running for near-instant color changes (~50ms).
+Keeps the OpenRGB server running for near-instant color changes
 
 ```sh
 walrgb instant on        # Enable background server
