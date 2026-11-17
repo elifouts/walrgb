@@ -20,6 +20,8 @@ Or install from the AUR:
 
 ```sh
 yay -S walrgb
+walrgb instant on
+walrgb apply
 ```
 
 ### Usage
@@ -42,8 +44,8 @@ walrgb detect            # List devices and supported modes
 Keeps the OpenRGB server running for near-instant color changes (~50ms).
 
 ```sh
-walrgb instant off       # Disable background server
 walrgb instant on        # Enable background server
+walrgb instant off       # Disable background server
 walrgb instant           # Check status
 ```
 
