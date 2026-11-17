@@ -1,4 +1,8 @@
-&#x20;\<p align="center">   \<a href="[https://git.io/typing-svg](https://git.io/typing-svg)">     \<img src="[https://readme-typing-svg.demolab.com?font=Fira+Code&duration=3000&pause=1000&color=14CB0B&center=true&multiline=true&width=435&lines=walrgb%24](https://readme-typing-svg.demolab.com?font=Fira+Code\&duration=3000\&pause=1000\&color=14CB0B\&center=true\&multiline=true\&width=435\&lines=walrgb%24)" alt="walrgb" />   \</a> \</p>
+<p align="center">
+  <a href="https://git.io/typing-svg">
+    <img src="https://readme-typing-svg.demolab.com?font=Fira+Code&duration=3000&pause=1000&color=14CB0B&center=true&multiline=true&width=435&lines=walrgb%24" alt="walrgb" />
+  </a>
+</p>
 
 Sync your RGB devices with **Pywal** colors using [OpenRGB](https://openrgb.org). Supports motherboards, RAM, GPUs, fans, keyboards, and more. No Pywal? Use any color.
 
@@ -18,6 +22,8 @@ yay -S walrgb
 
 ### Usage
 
+Run `walrgb apply` after `wal` (or add it to your theme script) to push the new colors.
+
 ```sh
 walrgb                  # Open TUI with device previews
 walrgb apply             # Apply current colors
@@ -31,7 +37,7 @@ walrgb detect            # List devices and supported modes
 
 ### Instant mode
 
-Keeps the OpenRGB server running for near-instant color changes (\~50ms).
+Keeps the OpenRGB server running for near-instant color changes (~50ms).
 
 ```sh
 walrgb instant off       # Disable background server
@@ -47,8 +53,8 @@ walrgb instant           # Check status
 
 Restores factory lighting effects.
 
-\<details>
-\<summary>\<b>Troubleshooting\</b>\</summary>
+<details>
+<summary><b>Troubleshooting</b></summary>
 
 - **RAM not detected:** Add your user to the `i2c` group and log back in:
 
@@ -64,4 +70,4 @@ Restores factory lighting effects.
 
 - **Missing devices:** If OpenRGB cannot detect a device, walrgb cannot either. Check the [OpenRGB device list](https://openrgb.org/devices.html).
 
-\</details>
+</details>
