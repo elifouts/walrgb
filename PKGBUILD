@@ -10,7 +10,7 @@ depends=('python' 'openrgb')
 optdepends=('python-pywal16: color source' 'python-pywal: color source')
 install=walrgb.install
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('SKIP')
+sha256sums=('4bea95422bf3a7201d5fa30e62ae9c8abae3239087e23601715c32272ba985c8')
 
 package() {
   cd "$pkgname-$pkgver"

@@ -11,6 +11,6 @@ pkgbase = walrgb
 	optdepends = python-pywal16: color source
 	optdepends = python-pywal: color source
 	source = walrgb-0.1.0.tar.gz::https://github.com/elifouts/walrgb/archive/refs/tags/v0.1.0.tar.gz
-	sha256sums = SKIP
+cd 	sha256sums = 4bea95422bf3a7201d5fa30e62ae9c8abae3239087e23601715c32272ba985c8
 
 pkgname = walrgb
