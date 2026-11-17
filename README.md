@@ -42,15 +42,15 @@ git clone https://github.com/elifouts/walrgb.git && cd walrgb && ./install.sh
 
 ```sh
 walrgb                      # tui with a live preview of every device
-walrgb mode wave            # static palette breathing flashing cycle wave rainbow
+walrgb mode cycle           # static, rainbow or cycle. cycle glides through wal1-6
 walrgb mode rainbow ram     # per device, by name or type
 walrgb color accent         # default. also wal0-15 or #ff8800
-walrgb cycle 10             # alternate through wal1-6 every 10s
+walrgb speed 30             # 0 is a minute a color, 100 is two seconds
 walrgb off keyboard         # hand it back, it gets its factory effect
 ```
 
 > [!NOTE]
-> Every mode works on every device. If the hardware has the effect, the hardware runs it. If not, walrgb animates it (per key on keyboards) and only stays running while it does.
+> Static is pushed once and nothing keeps running. Rainbow and cycle are animated by walrgb so they fade smoothly and stay in sync on every device, keyboards per key. If something replugs, walrgb picks it back up.
 
 <details>
   <summary><b>Missing a device?</b></summary>
