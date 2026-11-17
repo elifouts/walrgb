@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """walrgb - sync openrgb hardware lighting to pywal colors."""
-import colorsys, curses, glob, json, os, socket, struct, sys, time
+import atexit, colorsys, curses, fcntl, glob, json, os, socket, struct, subprocess, sys, threading, time
 
 HOST = os.environ.get("WALRGB_HOST", "127.0.0.1")
 PORT = int(os.environ.get("WALRGB_PORT", "6742"))
@@ -11,8 +11,11 @@ CFG = os.path.join(CFG_HOME, "walrgb", "config.json")
 WAL = os.path.join(CACHE_HOME, "wal", "colors")
 ROLES = os.path.join(CFG_HOME, "hypr", "state", "color-roles.json")  # accent picker from my dotfiles, optional
 COUNT = os.path.join(CACHE_HOME, "walrgb", "devices")
-HID = os.path.join(CACHE_HOME, "walrgb", "hid")
+LIST = os.path.join(CACHE_HOME, "walrgb", "list.json")  # last device list, so the tui can draw before openrgb is up
 OWNED = os.path.join(STATE_HOME, "walrgb", "owned.json")
+LOCK = os.path.join(CACHE_HOME, "walrgb", "lock")
+DONE = os.path.join(CACHE_HOME, "walrgb", "done")  # what the last finished apply saw
+LOG = os.path.join(CACHE_HOME, "walrgb", "apply.log")
 
 BLACK, BLUE = (0, 0, 0), "#0000ff"
 PRESETS = ["#0000ff", "#00a2ff", "#00ffd5", "#00ff3c", "#ffd000", "#ff6a00", "#ff0033", "#ff00c8", "#8000ff", "#ffffff"]
@@ -91,21 +94,76 @@ def pack_colors(cs):
     return struct.pack("<H", len(cs)) + bytes(v for c in cs for v in (*c, 0))
 
 
+SERVER = None
+
+
+def spawn():
+    """nothing listening, so run openrgb just for this command. it gets killed again when we exit"""
+    global SERVER
+    if SERVER or HOST not in ("127.0.0.1", "localhost"):
+        return False
+    try:
+        SERVER = subprocess.Popen(["openrgb", "--server", "--server-port", str(PORT)],
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except FileNotFoundError:
+        raise ConnectionError("openrgb isn't installed") from None
+    atexit.register(stop_server)
+    return True
+
+
+def stop_server():
+    global SERVER
+    if not SERVER:
+        return
+    time.sleep(0.5)  # i think some controllers flush leds on a worker thread, killing it instantly can eat the last write
+    SERVER.terminate()
+    try:
+        SERVER.wait(5)
+    except subprocess.TimeoutExpired:
+        SERVER.kill()
+    SERVER = None
+
+
+def active(unit):
+    try:
+        return subprocess.run(["systemctl", "--user", "is-active", "-q", unit]).returncode == 0
+    except OSError:
+        return False
+
+
+def instant(on=None):
+    """the resident server. on = ~50ms applies for ~14MB and a sliver of cpu, off = a ~1s scan every apply"""
+    if on is None:
+        print("instant", "on" if active("walrgb-openrgb.service") else "off")
+        return 0
+    act = ["enable", "--now"] if on else ["disable", "--now"]
+    return subprocess.run(["systemctl", "--user", *act, "-q", "walrgb-openrgb.service"]).returncode
+
+
 class OpenRGB:
-    def __init__(self, wait=0):
-        end = time.monotonic() + wait
+    def __init__(self):
+        end, fresh, waiting = time.monotonic() + 30, False, False
         while True:
             try:
                 self.sock = socket.create_connection((HOST, PORT), 2)
                 break
             except OSError:
-                if time.monotonic() >= end:
-                    raise ConnectionError(f"can't reach openrgb at {HOST}:{PORT}. is walrgb-openrgb.service running?")
-                time.sleep(1)
+                if not waiting:
+                    # resident server still coming up (login) -> wait for it, a second one would fight over the port
+                    resident = active("walrgb-openrgb.service")
+                    fresh = not resident and spawn()
+                    waiting = fresh or resident
+                if not waiting or time.monotonic() > end:
+                    raise ConnectionError(f"can't reach openrgb at {HOST}:{PORT}")
+                time.sleep(0.05)
         self.send(P_PROTO, data=struct.pack("<I", PROTO))
         if struct.unpack("<I", self.recv(P_PROTO))[0] < PROTO:
             raise ConnectionError("openrgb is too old, walrgb needs 0.6 or newer")
         self.send(P_NAME, data=b"walrgb\0")
+        if fresh:  # it answers before it's done scanning
+            settle(self)
+        else:
+            sync(self)
 
     def send(self, pid, dev=0, data=b""):
         self.sock.sendall(b"ORGB" + struct.pack("<III", dev, pid, len(data)) + data)
@@ -141,6 +199,8 @@ class OpenRGB:
                 out.append(self.device(i))
             except (struct.error, IndexError):
                 print(f"walrgb: couldn't read device {i}, skipping it", file=sys.stderr)
+        if out:
+            write_json(LIST, out)
         return out
 
     def set_mode(self, dev, idx, m):
@@ -218,7 +278,7 @@ def write_json(path, data):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path + ".tmp", "w") as f:
         json.dump(data, f, indent=2)
-    os.replace(path + ".tmp", path)  # atomic so the path unit never reads half a file
+    os.replace(path + ".tmp", path)  # atomic so a running apply never reads half a file
 
 
 def save_cfg(cfg):
@@ -423,14 +483,43 @@ def fit_zones(rgb, dev, cfg):
     return rgb.device(dev["idx"]) if sized else dev
 
 
-def settle(rgb, known, wait):
-    """wait until the server lists as many devices as last time, or the count stops moving"""
+def hw():
+    """cheap fingerprint of everything openrgb could find. same as last time means same devices"""
+    return hid() + sorted(os.listdir("/sys/bus/pci/devices")) + sorted(os.listdir("/sys/bus/i2c/devices"))
+
+
+def settle(rgb, wait=30):
+    """openrgb registers devices one by one while it scans. same hardware as last time: go the moment they're all
+    there. anything changed: wait for the count to sit still, then remember it"""
+    now, cache = hw(), read_json(COUNT, {})
+    known = cache.get("n") if isinstance(cache, dict) and cache.get("hw") == now else None
     end = time.monotonic() + wait
-    last, n = -1, rgb.count()
-    while n < known and not (n and n == last) and time.monotonic() < end:
-        time.sleep(0.5)
-        last, n = n, rgb.count()
+    n, moved = rgb.count(), time.monotonic()
+    # 2s of quiet, my gpu shows up 420ms after the ram so anything short of that bails halfway
+    while time.monotonic() < end and not (n >= known if known else n and time.monotonic() - moved > 2):
+        time.sleep(0.05)
+        m = rgb.count()
+        if m != n:
+            n, moved = m, time.monotonic()
+    if n and n != known:
+        write_json(COUNT, {"hw": now, "n": n})
     return n
+
+
+def sync(rgb):
+    """a long running server keeps writing to dead handles after a replug until it rescans"""
+    cache = read_json(COUNT, {})
+    if isinstance(cache, dict) and cache.get("hw") not in (None, hw()):
+        last = hid()
+        for _ in range(10):  # a wooting brings its 4 interfaces up over ~2.5s, rescanning mid way grabs a dead one
+            time.sleep(1)
+            now = hid()
+            if now == last:
+                break
+            last = now
+        rgb.send(P_RESCAN)
+        time.sleep(0.5)
+    settle(rgb)
 
 
 def hid():
@@ -438,44 +527,28 @@ def hid():
     return sorted(os.path.realpath(p) for p in glob.glob("/sys/class/hidraw/*"))
 
 
-def connect(wait):
-    rgb = OpenRGB(wait)
-    known = read_json(COUNT, 1)
-    known = known if isinstance(known, int) else 1
-    # on boot the server takes connections before it's done scanning and says 0 devices
-    n = settle(rgb, known, wait) if wait else rgb.count()
-    now, before = hid(), read_json(HID, None)
-    if before is not None and now != before:
-        # something replugged (my keyboard drops off its hub sometimes). openrgb keeps writing to the dead
-        # handle until it rescans. wait for it to finish coming back first, a wooting brings its 4
-        # interfaces up over ~2.5s and a rescan in the middle grabs a dead one
-        end = time.monotonic() + 10
-        while time.monotonic() < end:
-            time.sleep(1.5)
-            now, last = hid(), now
-            if now == last:
-                break
-        rgb.send(P_RESCAN)
-        time.sleep(0.5)
-        n = settle(rgb, max(n, known), 15)
-    if now != before:
-        write_json(HID, now)
-    if n and n != known:
-        write_json(COUNT, n)
-    return rgb
-
-
 def stamp():
     return tuple(os.stat(p).st_mtime_ns if os.path.exists(p) else 0 for p in (CFG, WAL, ROLES)), tuple(hid())
 
 
-def apply(wait=0):
+def apply():
     """push everything once and exit"""
+    os.makedirs(os.path.dirname(LOCK), exist_ok=True)
+    lock = open(LOCK, "w")
+    # one at a time, or two runs both spawn openrgb and fight over the port
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        # theme scripts fire a few of us at once. if the run we waited on already pushed this exact state, we're done
+        if read_json(DONE, None) == json.loads(json.dumps(stamp())):
+            return
+    retried = False
     while True:
         seen, cfg, pal = stamp(), load_cfg(), load_wal()
         try:
-            rgb = connect(wait)
-            owned = set(read_json(OWNED, []))
+            rgb = OpenRGB()
+            owned, pushed = set(read_json(OWNED, [])), []
             before = set(owned)
             for dev in rgb.devices():
                 if not controlled(dev["name"], dev["type"], cfg):
@@ -484,18 +557,35 @@ def apply(wait=0):
                         owned.discard(key(dev))
                     continue
                 owned.add(key(dev))
-                setup(rgb, fit_zones(rgb, dev, cfg), cfg, pal)
+                pushed.append(fit_zones(rgb, dev, cfg))
+                setup(rgb, pushed[-1], cfg, pal)
+            # after a burst of writes my msi board sometimes keeps its argb header (the pump) dark even though its
+            # memory says the right color, so openrgb can't even tell. saying it all again once it's quiet fixes it
+            time.sleep(0.3)
+            if stamp() == seen:  # otherwise the next round says it anyway
+                for dev in pushed:
+                    setup(rgb, dev, cfg, pal)
             if owned != before:
                 write_json(OWNED, sorted(owned))
             rgb.close()
         except ConnectionError:
-            if wait:
+            if retried:
                 raise
-            wait = 60  # server restarted under us, reconnect and rescan
-            continue
+            retried = True
+            continue  # we borrowed someone's server (the tui's) and it went away. next round starts our own
         if stamp() == seen:
-            return
-        # something changed while we were busy. the path unit can't retrigger an active unit, so go again
+            return write_json(DONE, seen)
+        # something changed while we were busy (a replug, or the theme script writing roles). go again
+
+
+def background():
+    """scripts shouldn't sit through openrgb's scan, so a detached copy of us does the work"""
+    stop_server()  # ours dying under the copy is what made applies silently do nothing
+    os.makedirs(os.path.dirname(LOG), exist_ok=True)
+    with open(LOG, "a") as log:
+        subprocess.Popen([sys.executable, os.path.realpath(__file__), "apply", "--fg"], start_new_session=True,
+                         stdin=subprocess.DEVNULL, stdout=log, stderr=log)
+    return 0
 
 
 # ---- detect ----
@@ -514,7 +604,7 @@ def detect():
     else:
         print(" pywal   not found, using " + ansi(resolve("accent", pal, cfg)) + f" {cfg['manual']}")
     if not devs:
-        print("\n openrgb sees no devices. check the i2c group / udev rules (see readme)")
+        print(f"\n openrgb sees no devices. check the i2c group / udev rules (see {REPO})")
     for d in devs:
         uniq = list(dict.fromkeys(d["colors"]))[:12]
         on = "\033[32mcontrolled\033[0m" if controlled(d["name"], d["type"], cfg) else "\033[2mignored\033[0m"
@@ -540,12 +630,18 @@ class Tui:
         curses.curs_set(0)
         curses.start_color()
         curses.use_default_colors()
-        self.refresh()
+        cached, self.live = read_json(LIST, None), None
+        if cached:  # draw from last time right away, swap in the real list once openrgb answers
+            self.refresh((cached, ""))
+            threading.Thread(target=lambda: setattr(self, "live", devices_quiet()), daemon=True).start()
+            self.scr.timeout(50)
+        else:
+            self.refresh()
 
-    def refresh(self):
+    def refresh(self, got=None):
         self.pal = load_wal()
         self.near = {}  # palette may have changed
-        self.all, self.msg = devices_quiet()
+        self.all, self.msg = got or devices_quiet()
         self.devs, self.counts = {}, {}
         for d in self.all:
             self.devs.setdefault(d["name"], d)
@@ -726,6 +822,11 @@ class Tui:
         keys = {curses.KEY_UP: -1, ord("k"): -1, curses.KEY_DOWN: 1, ord("j"): 1}
         sides = {curses.KEY_LEFT: -1, ord("h"): -1, curses.KEY_RIGHT: 1, ord("l"): 1}
         while True:
+            if self.live:
+                self.refresh(self.live)
+                self.live = None
+                self.sel %= len(self.GLOBAL) + len(self.names)
+                self.scr.timeout(-1)
             self.draw()
             k = self.scr.getch()
             if k == ord("q"):
@@ -746,11 +847,13 @@ class Tui:
 
 # ---- cli ----
 
-USAGE = """walrgb - sync rgb hardware to pywal
+REPO = "https://github.com/elifouts/walrgb"
+USAGE = f"""walrgb - sync rgb hardware to pywal
 
   walrgb                        tui
   walrgb detect                 every device walrgb can see
-  walrgb apply [--wait SECS]    push colors now (the service runs this)
+  walrgb instant [on|off]       keep openrgb running for ~50ms applies (default on), off = ~1s, nothing resident
+  walrgb apply [--fg]           push colors now, in the background unless --fg
   walrgb on|off|toggle [DEV]    lights on/off, or whether walrgb controls DEV
   walrgb mode static|rainbow [DEV]   rainbow is the device's own built-in one
   walrgb color SPEC [DEV]       accent, wal0-15 or #hex. no pywal = #hex only (default blue)
@@ -760,7 +863,9 @@ USAGE = """walrgb - sync rgb hardware to pywal
   walrgb zone NAME LEDS         led count for an argb header (fans, pumps, strips)
   walrgb reset                  give every device its factory effect back
 
-DEV matches part of a device name or a type like ram, gpu, keyboard."""
+DEV matches part of a device name or a type like ram, gpu, keyboard.
+
+docs and setup: {REPO}"""
 
 
 def match(arg):
@@ -777,9 +882,13 @@ def main(argv):
     try:
         if cmd == "tui":
             curses.wrapper(lambda s: Tui(s).run())
-            return 0
+            return background()
+        if cmd == "instant" and args in ([], ["on"], ["off"]):
+            return instant(args == ["on"] if args else None)
         if cmd == "apply":
-            return apply(float(args[1]) if args[:1] == ["--wait"] and len(args) > 1 else 0) or 0
+            if "--fg" in args:
+                return apply() or 0
+            return background()
         if cmd == "detect":
             return detect() or 0
         if cmd == "reset":
@@ -809,6 +918,7 @@ def main(argv):
             print(USAGE)
             return 0 if cmd in ("-h", "--help", "help") else 1
         save_cfg(cfg)
+        background()
     except (OSError, ValueError) as e:
         print(f"walrgb: {e}", file=sys.stderr)
         return 1

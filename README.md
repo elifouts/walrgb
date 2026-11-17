@@ -7,12 +7,12 @@
 <p align="center">
   <img src="https://img.shields.io/badge/pywal-colors-14cb0b?style=for-the-badge&labelColor=0a0a0a">
   <img src="https://img.shields.io/badge/OpenRGB-backend-0ce96b?style=for-the-badge&labelColor=0a0a0a">
-  <img src="https://img.shields.io/badge/idle-0%25%20cpu-52ff9c?style=for-the-badge&labelColor=0a0a0a">
+  <img src="https://img.shields.io/badge/applies%20in-50ms-52ff9c?style=for-the-badge&labelColor=0a0a0a">
 </p>
 
 Syncs your motherboard, RAM, AIO pump, fans, GPU, keyboard and anything else [OpenRGB](https://openrgb.org) supports to your **Pywal** colors. No pywal? Pick any color, default is blue.
 
-Nothing runs in the background. systemd watches `~/.cache/wal/colors`, and when it changes walrgb pushes the new color once and exits.
+Run `walrgb apply` after pywal, from a terminal, a script or a keybind.
 
 # Install
 
@@ -32,11 +32,38 @@ git clone https://github.com/elifouts/walrgb.git && cd walrgb && ./install.sh
 
   ```sh
   yay -S walrgb
-  systemctl --user enable --now walrgb.path
+  walrgb instant on
   ```
 
   RAM sits on SMBus, so add yourself to the `i2c` group and log back in: `sudo usermod -aG i2c $USER`
 </details>
+
+## Apply
+
+walrgb installs to `/usr/local/bin`, so `walrgb apply` works from any script or keybind. It applies in the background and returns at once, so your script keeps going. Errors go to `~/.cache/walrgb/apply.log`.
+
+```sh
+walrgb apply                              # push the current colors now
+wal -i ~/pics/wall.png && walrgb apply    # in a script or keybind
+walrgb apply --fg                         # wait until it's done
+```
+
+Config commands like `walrgb color` apply right away too, and the tui applies when you quit.
+
+## Instant
+
+By default `walrgb-openrgb.service` keeps OpenRGB's server running, so colors change in about 50ms. It uses around 14MB of RAM and a sliver of CPU while idle.
+
+```sh
+walrgb instant off   # nothing stays running, each change takes ~1s while OpenRGB scans
+walrgb instant on    # back to instant
+walrgb instant       # which one you're on
+```
+
+With instant off, your lights keep their color after OpenRGB exits, because walrgb only uses each device's static mode and its own built-in rainbow.
+
+> [!NOTE]
+> OpenRGB logs `recv_select failed receiving magic` every time walrgb disconnects. That's normal.
 
 ## Use
 
@@ -49,7 +76,7 @@ walrgb off keyboard         # hand it back, it gets its factory effect
 ```
 
 > [!NOTE]
-> walrgb sets your lights once and exits, so it uses no CPU or memory in between. Colors are gamma corrected for LEDs so they match your screen.
+> walrgb sets your lights once and exits, it never sits in a loop. Colors are gamma corrected for LEDs so they match your screen.
 
 <details>
   <summary><b>Missing a device?</b></summary>
