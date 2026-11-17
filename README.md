@@ -19,7 +19,7 @@ Run `walrgb apply` after pywal, from a terminal, a script or a keybind.
 ```sh
 git clone https://github.com/elifouts/walrgb.git && cd walrgb && ./install.sh
 ```
-
+# Uninstall
 ```sh
 ./install.sh -u     # uninstall, devices get their factory effect back
 ```
