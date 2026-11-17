@@ -1,4 +1,4 @@
-# Maintainer: Eli Fouts <your email here>
+# Maintainer: Eli Fouts mail@elifouts.net
 pkgname=walrgb
 pkgver=0.1.0
 pkgrel=1
