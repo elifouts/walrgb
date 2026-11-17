@@ -43,8 +43,7 @@ git clone https://github.com/elifouts/walrgb.git && cd walrgb && ./install.sh
 walrgb installs to `/usr/local/bin`, so `walrgb apply` works from any script or keybind. It applies in the background and returns at once, so your script keeps going. Errors go to `~/.cache/walrgb/apply.log`.
 
 ```sh
-walrgb apply                              # push the current colors now
-wal -i ~/pics/wall.png && walrgb apply    # in a script or keybind
+walrgb apply                              # push the current colors
 walrgb apply --fg                         # wait until it's done
 ```
 
