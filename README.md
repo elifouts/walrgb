@@ -20,8 +20,6 @@ Or install from the AUR:
 
 ```sh
 yay -S walrgb
-walrgb instant on
-walrgb apply
 ```
 
 ### Usage
