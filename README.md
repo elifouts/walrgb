@@ -12,7 +12,7 @@
 
 Syncs your motherboard, RAM, AIO pump, fans, GPU, keyboard and anything else [OpenRGB](https://openrgb.org) supports to your **Pywal** colors. No pywal? Pick any color, default is blue.
 
-Nothing runs in the background. systemd watches `~/.cache/wal/colors` and walrgb pushes the new colors once when they change.
+Nothing runs in the background. systemd watches `~/.cache/wal/colors`, and when it changes walrgb pushes the new color once and exits.
 
 # Install
 
@@ -41,16 +41,15 @@ git clone https://github.com/elifouts/walrgb.git && cd walrgb && ./install.sh
 ## Use
 
 ```sh
-walrgb                      # tui with a live preview of every device
-walrgb mode cycle           # static, rainbow or cycle. cycle glides through wal1-6
-walrgb mode rainbow ram     # per device, by name or type
+walrgb                      # tui with a preview of every device
 walrgb color accent         # default. also wal0-15 or #ff8800
-walrgb speed 30             # 0 is a minute a color, 100 is two seconds
+walrgb mode rainbow         # static, or each device's own built-in rainbow
+walrgb mode rainbow ram     # per device, by name or type
 walrgb off keyboard         # hand it back, it gets its factory effect
 ```
 
 > [!NOTE]
-> Colors are gamma corrected for LEDs so they look like your screen, not washed out. Static is pushed once and nothing keeps running. Rainbow and cycle are animated by walrgb so they fade smoothly and stay in sync on every device, keyboards per key. If something replugs, walrgb picks it back up.
+> walrgb sets your lights once and exits, so it uses no CPU or memory in between. Colors are gamma corrected for LEDs so they match your screen.
 
 <details>
   <summary><b>Missing a device?</b></summary>
